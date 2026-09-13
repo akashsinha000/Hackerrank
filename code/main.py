@@ -98,7 +98,7 @@ def recurring_events(events: list[dict[str, str]], home: str, rates: dict, image
 	for row in events:
 		amount = event_amount(row, image_text)
 		if amount is not None and row["status"] == "settled" and parse_date(row["event_date"]) <= cutoff:
-			grouped[(row["category"], row["description"], row["currency"])].append(row)
+			grouped[(row["category"], row["direction"], row["currency"])].append(row)
 	result = []
 	for rows in grouped.values():
 		rows.sort(key=lambda row: row["event_date"])
@@ -109,8 +109,19 @@ def recurring_events(events: list[dict[str, str]], home: str, rates: dict, image
 		if not recent_gaps or not all(20 <= gap <= 45 for gap in recent_gaps) or max(recent_gaps) - min(recent_gaps) > 5:
 			continue
 		latest = rows[-1]
-		amount = event_amount(latest, image_text)
-		result.append({"row": latest, "amount": convert(amount, latest["currency"], home, latest["settlement_date"], rates), "interval": round(sum(gaps[-3:]) / min(3, len(gaps)))})
+		recent_rows = rows[-min(6, len(rows)):]
+		recent_amounts = [
+			convert(event_amount(row, image_text), row["currency"], home, row["settlement_date"], rates)
+			for row in recent_rows
+		]
+		amount = sum(recent_amounts, Decimal(0)) / len(recent_amounts)
+		average_gap = round(sum(gaps[-3:]) / min(3, len(gaps)))
+		result.append({
+			"row": latest,
+			"amount": money(amount),
+			"interval": average_gap,
+			"monthly": 25 <= average_gap <= 35,
+		})
 	return result
 
 
@@ -133,7 +144,7 @@ def future_cashflows(user_events: list[dict[str, str]], profile: dict[str, str],
 			if current >= start:
 				adjusted = changes.get(row["event_id"], amount)
 				flows[current] += adjusted if row["direction"] == "credit" else -adjusted
-			current += timedelta(days=interval)
+			current = add_months(current) if item["monthly"] else current + timedelta(days=interval)
 	return flows
 
 
@@ -190,20 +201,6 @@ def decide(request: dict[str, str], profile: dict[str, str], user_events: list[d
 		elif row["category"] in reduce_categories and row["flexibility"] in {"reducible", "reducible_or_stoppable"}:
 			minimum = money(row["minimum_allowed_amount"] or "0")
 			change_options.append((row["event_id"], minimum, f"reduce_to:{row['event_id']}:{fmt(minimum)}"))
-	viable_changes = None
-	for size in range(1, min(3, len(change_options)) + 1):
-		for selected in combinations(change_options, size):
-			changes = {event_id: amount for event_id, amount, _ in selected}
-			changed_flows = future_cashflows(user_events, profile, start, end, rates, image_text, changes)
-			full = {start: target}
-			if all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, changed_flows, start, end, full).values()):
-				viable_changes = (changes, "|".join(item[2] for item in selected))
-				break
-		if viable_changes:
-			break
-	selected_changes = viable_changes[0] if viable_changes else None
-	selected_change_text = viable_changes[1] if viable_changes else "none"
-	plan_flows = future_cashflows(user_events, profile, start, end, rates, image_text, selected_changes) if selected_changes else flows
 	earliest = None
 	for offset in range((end - start).days + 1):
 		day = start + timedelta(days=offset)
@@ -212,21 +209,44 @@ def decide(request: dict[str, str], profile: dict[str, str], user_events: list[d
 			earliest = day
 			break
 
-	candidates = []
-	if "full_payment" in methods:
-		full = {start: target}
-		if all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, plan_flows, start, end, full).values()):
-			candidates.append((0, 0, start, "full_payment", full, None))
-	if "partial_payment" in methods and request["allows_partial_payment"].lower() == "true" and 0 < safe_today < target and earliest and earliest <= deadline:
-		partial = {start: safe_today, earliest: target - safe_today}
-		if all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, plan_flows, start, end, partial).values()):
-			candidates.append((1, 0, start, "partial_payment", partial, None))
-	for option in options:
-		if option["payment_method"] != "installments" or "installments" not in methods:
-			continue
-		schedule = option_schedule(option, start, deadline)
-		if schedule and sum(schedule.values()) >= target and all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, plan_flows, start, end, schedule).values()):
-			candidates.append((2, money(option["total_payable_amount"]), min(schedule), "installments", schedule, option))
+	def build_candidates(plan_flows: dict[date, Decimal]) -> list[tuple]:
+		candidates = []
+		if "full_payment" in methods:
+			full = {start: target}
+			if all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, plan_flows, start, end, full).values()):
+				candidates.append((0, 0, start, "full_payment", full, None))
+		if "partial_payment" in methods and request["allows_partial_payment"].lower() == "true" and 0 < safe_today < target and earliest and earliest <= deadline:
+			partial = {start: safe_today, earliest: target - safe_today}
+			if all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, plan_flows, start, end, partial).values()):
+				candidates.append((1, 0, start, "partial_payment", partial, None))
+		for option in options:
+			if option["payment_method"] != "installments" or "installments" not in methods:
+				continue
+			schedule = option_schedule(option, start, deadline)
+			if schedule and sum(schedule.values()) >= target and all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, plan_flows, start, end, schedule).values()):
+				candidates.append((2, money(option["total_payable_amount"]), min(schedule), "installments", schedule, option))
+		return candidates
+
+	selected_changes = None
+	selected_change_text = "none"
+	plan_flows = flows
+	candidates = build_candidates(plan_flows)
+	if not candidates:
+		viable_changes = None
+		for size in range(1, min(3, len(change_options)) + 1):
+			for selected in combinations(change_options, size):
+				changes = {event_id: amount for event_id, amount, _ in selected}
+				changed_flows = future_cashflows(user_events, profile, start, end, rates, image_text, changes)
+				full = {start: target}
+				if all(value >= money(profile["minimum_balance_to_keep"]) for value in balance_on_dates(profile, changed_flows, start, end, full).values()):
+					viable_changes = (changes, "|".join(item[2] for item in selected))
+					break
+			if viable_changes:
+				break
+		if viable_changes:
+			selected_changes, selected_change_text = viable_changes
+			plan_flows = future_cashflows(user_events, profile, start, end, rates, image_text, selected_changes)
+			candidates = build_candidates(plan_flows)
 	if candidates:
 		candidates.sort(key=lambda item: (item[0], item[1], item[2], item[5]["payment_option_id"] if item[5] else ""))
 		chosen = candidates[0]
@@ -269,7 +289,11 @@ def main() -> None:
 	rates = build_rates(read_csv("exchange_rates.csv"))
 	messages = read_csv("messages.csv")
 	advisor = AgenticAdvisor()
-	image_text = {}
+	image_text = {
+		row["related_event_id"]: row["amount"]
+		for row in read_csv("image_amounts.csv")
+		if row["related_event_id"]
+	}
 	rows = []
 	for request in requests:
 		profile = profiles[request["user_id"]]
