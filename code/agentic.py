@@ -23,9 +23,16 @@ class Usage:
 
 class AgenticAdvisor:
     def __init__(self) -> None:
-        self.api_key = os.getenv("BUY_WAIT_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-        self.endpoint = os.getenv("BUY_WAIT_LLM_ENDPOINT", "https://api.openai.com/v1/chat/completions")
-        self.model = os.getenv("BUY_WAIT_LLM_MODEL", "gpt-4o-mini")
+        self.provider = os.getenv("BUY_WAIT_LLM_PROVIDER", "openai").lower()
+        if self.provider == "anthropic":
+            self.api_key = os.getenv("BUY_WAIT_LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+            self.endpoint = os.getenv("BUY_WAIT_LLM_ENDPOINT", "https://api.anthropic.com/v1/messages")
+            self.model = os.getenv("BUY_WAIT_LLM_MODEL", "claude-3-5-haiku-latest")
+        else:
+            self.provider = "openai"
+            self.api_key = os.getenv("BUY_WAIT_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            self.endpoint = os.getenv("BUY_WAIT_LLM_ENDPOINT", "https://api.openai.com/v1/chat/completions")
+            self.model = os.getenv("BUY_WAIT_LLM_MODEL", "gpt-4o-mini")
         self.usage = Usage()
 
     @property
@@ -35,31 +42,47 @@ class AgenticAdvisor:
     def advise(self, request: dict[str, str], profile: dict[str, str], baseline: dict[str, str], evidence: list[dict[str, str]]) -> dict[str, str]:
         if not self.enabled:
             return baseline
-        payload = {
-            "model": self.model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": (
-                    "You are the evidence-reasoning layer of a financial affordability agent. "
-                    "The deterministic baseline is the safety authority. Return JSON only with "
-                    "decision_explanation and proposed_payment_method. Never invent facts, income, "
-                    "payment options, or amounts. Keep the proposed method equal to the baseline "
-                    "unless the evidence clearly supports the same safe plan."
-                )},
-                {"role": "user", "content": json.dumps({
-                    "request": request,
-                    "profile": {key: profile[key] for key in ("home_currency", "minimum_balance_to_keep", "financial_priorities", "payment_methods_user_will_consider")},
-                    "baseline": baseline,
-                    "evidence": evidence,
-                }, ensure_ascii=True)},
-            ],
-        }
+        system_prompt = (
+            "You are the evidence-reasoning layer of a financial affordability agent. "
+            "The deterministic baseline is the safety authority. Return JSON only with "
+            "decision_explanation and proposed_payment_method. Never invent facts, income, "
+            "payment options, or amounts. Keep the proposed method equal to the baseline "
+            "unless the evidence clearly supports the same safe plan."
+        )
+        user_content = json.dumps({
+            "request": request,
+            "profile": {key: profile[key] for key in ("home_currency", "minimum_balance_to_keep", "financial_priorities", "payment_methods_user_will_consider")},
+            "baseline": baseline,
+            "evidence": evidence,
+        }, ensure_ascii=True)
+        if self.provider == "anthropic":
+            payload = {
+                "model": self.model,
+                "max_tokens": 700,
+                "temperature": 0,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+        else:
+            payload = {
+                "model": self.model,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+            }
         body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.provider == "anthropic":
+            headers.update({"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
+        else:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         request_obj = urllib.request.Request(
             self.endpoint,
             data=body,
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -67,9 +90,14 @@ class AgenticAdvisor:
                 result = json.loads(response.read().decode("utf-8"))
             usage = result.get("usage", {})
             self.usage.calls += 1
-            self.usage.input_tokens += int(usage.get("prompt_tokens", 0))
-            self.usage.output_tokens += int(usage.get("completion_tokens", 0))
-            content = result["choices"][0]["message"]["content"]
+            if self.provider == "anthropic":
+                self.usage.input_tokens += int(usage.get("input_tokens", 0))
+                self.usage.output_tokens += int(usage.get("output_tokens", 0))
+                content = result["content"][0]["text"]
+            else:
+                self.usage.input_tokens += int(usage.get("prompt_tokens", 0))
+                self.usage.output_tokens += int(usage.get("completion_tokens", 0))
+                content = result["choices"][0]["message"]["content"]
             proposal = json.loads(content)
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return baseline
@@ -84,7 +112,7 @@ class AgenticAdvisor:
 
     def write_usage_report(self, path: str, request_count: int) -> None:
         average = (self.usage.input_tokens + self.usage.output_tokens) / request_count if request_count else 0
-        provider = "OpenAI-compatible endpoint" if self.enabled else "none (deterministic fallback)"
+        provider = self.provider if self.enabled else "none (deterministic fallback)"
         text = f"""# LLM Usage Report
 
 - Provider: {provider}
