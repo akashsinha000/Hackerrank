@@ -98,7 +98,8 @@ def recurring_events(events: list[dict[str, str]], home: str, rates: dict, image
 	for row in events:
 		amount = event_amount(row, image_text)
 		if amount is not None and row["status"] == "settled" and parse_date(row["event_date"]) <= cutoff:
-			grouped[(row["category"], row["direction"], row["currency"])].append(row)
+			series = row["description"] if row["direction"] == "credit" else row["category"]
+			grouped[(series, row["direction"], row["currency"])].append(row)
 	result = []
 	for rows in grouped.values():
 		rows.sort(key=lambda row: row["event_date"])
@@ -231,6 +232,8 @@ def decide(request: dict[str, str], profile: dict[str, str], user_events: list[d
 	selected_change_text = "none"
 	plan_flows = flows
 	candidates = build_candidates(plan_flows)
+	if not candidates and earliest and earliest <= deadline and "full_payment" in methods:
+		return make_output(request, safe_today, "affordable_later", "wait", {earliest: target}, earliest, "none", profile)
 	if not candidates:
 		viable_changes = None
 		for size in range(1, min(3, len(change_options)) + 1):
